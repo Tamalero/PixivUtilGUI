@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Packaging output — the AppImage and its .zsync are release assets, not source.
+build/
+dist/
+*.spec
+*.AppImage
+*.AppImage.zsync
+*.AppDir/
+*.old-*
+
+# Local state. The path to the PixivUtil2 checkout is per-machine and now lives
+# in $XDG_CONFIG_HOME/pixivutil-gui/, but ignore the old in-tree name too so an
+# older working copy cannot commit one.
+pixivutil-gui.ini

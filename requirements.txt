@@ -1,0 +1,9 @@
+# PixivUtil2 GUI — front end only.
+#
+# On Arch/CachyOS install with pacman instead of pip:
+#   sudo pacman -S python-pyqt6
+#
+# PixivUtil2 itself is NOT a pip dependency: it is a separate checkout that this
+# GUI drives as a child process, using that checkout's own interpreter.
+
+PyQt6>=6.4

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PixivUtil2 GUI
+GenericName=Media Downloader
+Comment=Graphical front end for the PixivUtil2 downloader
+Exec=pixivutilgui
+Icon=pixivutilgui
+Terminal=false
+Categories=Network;FileTransfer;Graphics;
+Keywords=pixiv;fanbox;sketch;download;images;art;

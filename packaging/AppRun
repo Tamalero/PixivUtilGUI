@@ -1,0 +1,21 @@
+#!/bin/bash
+# AppImage entry point.
+#
+# POSIX/bash on purpose: this runs on whatever machine the AppImage lands on,
+# which is not guaranteed to have fish. The build script beside it is fish,
+# because that one only ever runs on the author's box.
+set -e
+HERE="$(dirname "$(readlink -f "${0}")")"
+
+# Qt finds its plugins relative to the binary, but be explicit — a stray
+# QT_PLUGIN_PATH in the user's environment otherwise points Qt at their system
+# Qt, which is a different build and crashes on load.
+export QT_PLUGIN_PATH="${HERE}/usr/bin/PyQt6/Qt6/plugins"
+export QML2_IMPORT_PATH="${HERE}/usr/bin/PyQt6/Qt6/qml"
+
+# $OWD is where the user ran the AppImage from. gui.py uses it (and $APPIMAGE)
+# to look for a PixivUtil2 checkout in sibling directories, since HERE is a
+# throwaway mount point.
+export OWD="${OWD:-$PWD}"
+
+exec "${HERE}/usr/bin/pixivutilgui" "$@"
