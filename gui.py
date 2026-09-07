@@ -27,11 +27,13 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import shutil
 import select
 import signal
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,7 +49,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QStatusBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 
 # Frozen (PyInstaller/AppImage) builds have no __file__ on disk to speak of, and
 # the bundle is mounted read-only, so nothing may be written next to it.
@@ -111,6 +113,49 @@ def is_pixivutil_dir(path) -> bool:
     """A checkout is usable when the entry point and its handlers are there."""
     path = Path(path).expanduser()
     return (path / SCRIPT).is_file() and (path / "handler").is_dir()
+
+
+# PixivUtil2 passes userAgentImpersonation straight to curl_cffi's
+# impersonate= argument, so the valid values are whatever that build supports.
+# Ask the checkout's own interpreter rather than guessing; this list is only the
+# fallback for when that cannot be run.
+FALLBACK_IMPERSONATE = (
+    "chrome", "chrome136", "chrome133a", "chrome131", "chrome124",
+    "chrome_android", "chrome131_android",
+    "firefox", "firefox135", "firefox133",
+    "edge", "edge101", "edge99",
+    "safari", "safari260", "safari184", "safari180", "safari170",
+    "safari_ios", "safari260_ios", "safari184_ios", "safari180_ios",
+    "tor145",
+)
+CUSTOM_IMPERSONATE = "__custom__"
+_impersonate_cache: tuple | None = None
+
+
+def impersonation_targets() -> tuple:
+    """The impersonation values the checkout's curl_cffi actually accepts."""
+    global _impersonate_cache
+    if _impersonate_cache is not None:
+        return _impersonate_cache
+
+    code = (
+        "import typing\n"
+        "from curl_cffi.requests.impersonate import BrowserTypeLiteral as B\n"
+        "print('\\n'.join(typing.get_args(B)))\n"
+    )
+    targets: tuple = ()
+    try:
+        result = subprocess.run([find_python(), "-c", code], capture_output=True,
+                                text=True, timeout=20, cwd=str(PIXIVUTIL_DIR))
+        if result.returncode == 0:
+            found = tuple(line.strip() for line in result.stdout.splitlines()
+                          if line.strip())
+            if found:
+                targets = found
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _impersonate_cache = targets or FALLBACK_IMPERSONATE
+    return _impersonate_cache
 
 
 def open_externally(path) -> bool:
@@ -220,29 +265,49 @@ def browse_start_dir(current: str = "") -> str:
     return str(Path.home())
 
 
-def remembered_dir() -> Path | None:
-    """The folder saved by a previous run, if it is still valid."""
+def load_settings() -> dict:
+    """The GUI's own settings (not config.ini) as a flat key/value mapping."""
     try:
         text = SETTINGS_FILE.read_text(encoding="utf-8")
     except OSError:
-        return None
+        return {}
+    values = {}
     for line in text.splitlines():
-        key, _, value = line.partition("=")
-        if key.strip() == "pixivutil_dir":
-            candidate = Path(value.strip()).expanduser()
-            if is_pixivutil_dir(candidate):
-                return candidate.resolve()
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def save_settings(**changes) -> None:
+    """Merge changes into the settings file. Never fatal — worst case we re-ask."""
+    values = load_settings()
+    values.update({k: str(v) for k, v in changes.items()})
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(
+            "# Written by PixivUtilGUI. Safe to delete.\n"
+            + "".join(f"{k} = {v}\n" for k, v in sorted(values.items())),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def remembered_dir() -> Path | None:
+    """The folder saved by a previous run, if it is still valid."""
+    raw = load_settings().get("pixivutil_dir", "")
+    if raw:
+        candidate = Path(raw).expanduser()
+        if is_pixivutil_dir(candidate):
+            return candidate.resolve()
     return None
 
 
 def remember_dir(path: Path) -> None:
-    try:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(
-            "# Written by PixivUtilGUI — where the PixivUtil2 checkout lives.\n"
-            f"pixivutil_dir = {path}\n", encoding="utf-8")
-    except OSError:
-        pass                                # not fatal, just re-ask next time
+    save_settings(pixivutil_dir=path)
 
 
 def locate_pixivutil(explicit: str = "") -> Path | None:
@@ -359,8 +424,15 @@ class Mode:
 
 PAGES = [
     F("start_page", "Start page", "int", 1),
-    F("end_page", "End page", "int", 0, tip="0 = no limit"),
+    F("end_page", "End page", "int", 0,
+      tip="0 means NO LIMIT — every page will be downloaded"),
 ]
+
+# Shown under the form whenever End page is left at 0.
+NO_LIMIT_WARNING = (
+    "⚠  End page is 0, which means <b>no limit</b>: this will keep going "
+    "through every page until there is nothing left — the artist's entire "
+    "gallery, or the whole bookmark list. Set an end page to stop earlier.")
 DATES = [
     F("start_date", "Start date", "date", tip="YYYY-MM-DD, leave blank for none"),
     F("end_date", "End date", "date", tip="YYYY-MM-DD, leave blank for none"),
@@ -674,7 +746,8 @@ SETTINGS_SCHEMA = [
     ("Authentication", [
         ("Authentication", "cookie", "Pixiv PHPSESSID cookie", "text", ()),
         ("Authentication", "cookieFanbox", "FANBOX session cookie", "text", ()),
-        ("Authentication", "userAgentImpersonation", "Impersonate", "text", ()),
+        ("Authentication", "userAgentImpersonation", "Impersonate browser",
+         "impersonate", ()),
     ]),
     ("Filenames", [
         ("Filename", "filenameFormat", "Illustration", "text", ()),
@@ -687,7 +760,7 @@ SETTINGS_SCHEMA = [
     ]),
     ("Download control", [
         ("Pixiv", "numberOfPage", "Default page limit", "int", ()),
-        ("Pixiv", "r18mode", "R-18 mode", "bool", ()),
+        ("Pixiv", "r18mode", "R-18 mode  (adult material)", "bool", ()),
         ("DownloadControl", "overwrite", "Overwrite existing files", "bool", ()),
         ("DownloadControl", "checkLastModified", "Check last-modified", "bool", ()),
         ("DownloadControl", "dateDiff", "Only images newer than N days", "int", ()),
@@ -697,7 +770,7 @@ SETTINGS_SCHEMA = [
         ("Settings", "writeImageInfo", "Write .txt info files", "bool", ()),
         ("Settings", "writeImageJSON", "Write .json info files", "bool", ()),
     ]),
-    ("Network", [
+    ("Network and Download Options", [
         ("Network", "downloadDelay", "Delay between downloads (s)", "int", ()),
         ("Network", "timeout", "Timeout (s)", "int", ()),
         ("Network", "retry", "Retries", "int", ()),
@@ -727,6 +800,19 @@ SETTINGS_SCHEMA = [
         ("Debug", "disableLog", "Disable logging", "bool", ()),
     ]),
 ]
+
+
+# Settings that need a louder presentation than the rest.
+DANGER_KEYS = {("Pixiv", "r18mode")}
+
+R18_WARNING = (
+    "R-18 mode makes PixivUtil2 request age-restricted, sexually explicit "
+    "material from Pixiv.\n\n"
+    "Only enable this if you are of legal age in your jurisdiction and want "
+    "that content downloaded into your library. It applies to ranking and "
+    "new-illust modes, which fetch whatever Pixiv returns — you will not be "
+    "asked to confirm individual works.\n\n"
+    "Enable R-18 mode?")
 
 
 def read_ini(path: Path) -> dict:
@@ -790,6 +876,125 @@ def patch_ini(path: Path, changes: dict) -> None:
 
 def as_bool(value: str, default: bool = False) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on") if value else default
+
+
+# ── comic archives ────────────────────────────────────────────────────────────
+
+# CBZ is a zip and CBR is a rar, both just renamed. Only the container differs.
+COMIC_FORMATS = (("cbz", "CBZ  (zip — no extra tools needed)"),
+                 ("cbr", "CBR  (rar — needs the 'rar' command)"))
+
+
+def rar_available() -> bool:
+    """unrar can only extract; making a .cbr needs the proprietary 'rar'."""
+    return shutil.which("rar") is not None
+
+
+def comic_images_directly_in(folder: Path) -> bool:
+    """True when the folder itself holds images, rather than artist sub-folders."""
+    try:
+        return any(p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+                   for p in folder.iterdir())
+    except OSError:
+        return False
+
+
+def natural_key(text: str) -> list:
+    """Sort key where embedded numbers compare numerically, so p2 precedes p10."""
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", text)]
+
+
+def comic_images(folder: Path) -> list:
+    """
+    Every image under a folder, in reading order.
+
+    Plain lexicographic order puts "_p10" before "_p2", which is exactly wrong
+    for a comic, so compare the page numbers as numbers.
+    """
+    found = [p for p in folder.rglob("*")
+             if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES]
+    return sorted(found, key=lambda p: natural_key(str(p.relative_to(folder))))
+
+
+class ComicWorker(QThread):
+    """Builds one archive per folder, off the UI thread."""
+
+    log = pyqtSignal(str, str)        # (text, level)
+    done = pyqtSignal(int, int, int)  # (built, skipped, failed)
+
+    def __init__(self, folders, out_dir: Path, fmt: str):
+        super().__init__()
+        self.folders = list(folders)
+        self.out_dir = Path(out_dir)
+        self.fmt = fmt
+        self._stop = False
+
+    def cancel(self):
+        self._stop = True
+
+    def run(self):
+        built = skipped = failed = 0
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            self.log.emit(f"Cannot create {self.out_dir}: {ex}", "error")
+            self.done.emit(0, 0, len(self.folders))
+            return
+
+        for folder in self.folders:
+            if self._stop:
+                break
+            if not folder.is_dir():
+                skipped += 1
+                continue
+            images = comic_images(folder)
+            if not images:
+                self.log.emit(f"No images in {folder.name}, skipped.", "warn")
+                skipped += 1
+                continue
+            target = self.out_dir / f"{folder.name}.{self.fmt}"
+            try:
+                self._build(folder, images, target)
+            except Exception as ex:                      # noqa: BLE001 — report, continue
+                self.log.emit(f"Failed to build {target.name}: {ex}", "error")
+                failed += 1
+                continue
+            size = target.stat().st_size / (1024 * 1024)
+            self.log.emit(
+                f"Comic: {target.name} — {len(images)} images, {size:.1f} MiB", "ok")
+            built += 1
+        self.done.emit(built, skipped, failed)
+
+    def _build(self, folder: Path, images: list, target: Path):
+        """Write to a temporary file and swap it in, so a crash cannot truncate."""
+        temp = target.with_name(target.name + ".part")
+        try:
+            if self.fmt == "cbz":
+                # Stored, not deflated: these are already-compressed images, so
+                # compressing again costs time and saves nothing.
+                with zipfile.ZipFile(temp, "w", zipfile.ZIP_STORED) as archive:
+                    for image in images:
+                        if self._stop:
+                            raise RuntimeError("cancelled")
+                        archive.write(image, str(image.relative_to(folder)))
+            else:
+                if not rar_available():
+                    raise RuntimeError("the 'rar' command is not installed")
+                result = subprocess.run(
+                    ["rar", "a", "-ep1", "-m0", "-y", "--", str(temp),
+                     *[str(i) for i in images]],
+                    cwd=str(folder), capture_output=True, text=True, timeout=3600)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        (result.stderr or result.stdout or "rar failed").strip()[:200])
+            os.replace(temp, target)
+        finally:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
 
 
 # ── the child process ─────────────────────────────────────────────────────────
@@ -1058,6 +1263,7 @@ class ModeForm(QWidget):
         super().__init__()
         self.mode = mode
         self.getters = {}
+        self.widgets = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1075,6 +1281,7 @@ class ModeForm(QWidget):
         for f in mode.fields:
             widget, getter = self._make(f, on_change)
             self.getters[f.key] = getter
+            self.widgets[f.key] = widget
             if f.tip:
                 widget.setToolTip(f.tip)
             if f.kind == "bool":
@@ -1082,11 +1289,28 @@ class ModeForm(QWidget):
             else:
                 form.addRow(f.label + ":", widget)
 
+        # "End page 0" quietly means "download everything", which is a much
+        # bigger job than it looks. Say so, and only while it applies.
+        self.no_limit = QLabel(NO_LIMIT_WARNING)
+        self.no_limit.setWordWrap(True)
+        self.no_limit.setTextFormat(Qt.TextFormat.RichText)
+        self.no_limit.setStyleSheet(
+            "color: #8a6100; background: rgba(255,193,7,0.18);"
+            "border: 1px solid rgba(255,193,7,0.55); border-radius: 4px; padding: 6px;")
+        self.no_limit.setVisible(False)
+        layout.addWidget(self.no_limit)
+        if "end_page" in self.getters:
+            self.widgets["end_page"].valueChanged.connect(self._check_no_limit)
+            self._check_no_limit()
+
         if not mode.fields and not mode.note:
             hint = QLabel("No options — press Run.")
             hint.setStyleSheet("color: palette(mid);")
             layout.addWidget(hint)
         layout.addStretch(1)
+
+    def _check_no_limit(self, *_):
+        self.no_limit.setVisible(self.getters["end_page"]() == 0)
 
     def _make(self, f: F, on_change):
         if f.kind == "bool":
@@ -1166,6 +1390,8 @@ class MainWindow(QMainWindow):
         self.worker: RunWorker | None = None
         self._running = False
         self._setting_widgets = {}
+        self.comic_worker: ComicWorker | None = None
+        self._touched_dirs: set = set()
 
         self._build_menu()
         self._build_ui()
@@ -1246,6 +1472,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_download_tab(), "Download")
         tabs.addTab(self._build_settings_tab(), "Settings")
         tabs.addTab(self._build_lists_tab(), "Lists")
+        tabs.addTab(self._build_comics_tab(), "Comics")
         return tabs
 
     def _build_download_tab(self) -> QWidget:
@@ -1329,11 +1556,19 @@ class MainWindow(QMainWindow):
                 current = self.config_values.get((section, key), "")
                 widget, getter, setter = self._make_setting(kind, current, choices)
                 self._setting_widgets[(section, key)] = (getter, setter)
+                danger = (section, key) in DANGER_KEYS
                 if kind == "bool":
                     widget.setText(label)
+                    if danger:
+                        widget.setStyleSheet("color: #c62828; font-weight: bold;")
+                        widget.toggled.connect(
+                            lambda on, box=widget: self._confirm_danger(box, on))
                     form.addRow("", widget)
                 else:
-                    form.addRow(label + ":", widget)
+                    caption = QLabel(label + ":")
+                    if danger:
+                        caption.setStyleSheet("color: #c62828; font-weight: bold;")
+                    form.addRow(caption, widget)
             inner_box.addWidget(group)
         inner_box.addStretch(1)
 
@@ -1360,8 +1595,60 @@ class MainWindow(QMainWindow):
         outer.addLayout(buttons)
         return page
 
+    def _confirm_danger(self, box: QCheckBox, enabled: bool):
+        """Warn once, the first time adult content is switched on."""
+        if not enabled or as_bool(load_settings().get("r18_acknowledged", "")):
+            return
+        answer = QMessageBox.warning(
+            self, "Enable R-18 (adult) mode?", R18_WARNING,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            save_settings(r18_acknowledged="true")
+        else:
+            box.setChecked(False)
+
     def _make_setting(self, kind, current, choices):
         """Returns (widget, read value as a string, write value from a string)."""
+        if kind == "impersonate":
+            row = QWidget()
+            box = QHBoxLayout(row)
+            box.setContentsMargins(0, 0, 0, 0)
+            combo = QComboBox()
+            for target in impersonation_targets():
+                combo.addItem(target, target)
+            combo.addItem("Custom…", CUSTOM_IMPERSONATE)
+            edit = QLineEdit()
+            edit.setPlaceholderText("exact curl_cffi impersonate value")
+            box.addWidget(combo, 1)
+            box.addWidget(edit, 1)
+
+            def sync(*_):
+                edit.setVisible(combo.currentData() == CUSTOM_IMPERSONATE)
+
+            def read():
+                if combo.currentData() == CUSTOM_IMPERSONATE:
+                    return edit.text().strip()
+                return combo.currentData()
+
+            def write(value):
+                value = (value or "").strip()
+                index = combo.findData(value)
+                if value and index < 0:      # something curl_cffi no longer lists
+                    combo.setCurrentIndex(combo.findData(CUSTOM_IMPERSONATE))
+                    edit.setText(value)
+                else:
+                    combo.setCurrentIndex(max(index, 0))
+                    edit.clear()
+                sync()
+
+            combo.currentIndexChanged.connect(sync)
+            write(current)
+            row.setToolTip(
+                "Which browser PixivUtil2 pretends to be. The list comes from "
+                "the curl_cffi installed in your PixivUtil2 checkout.")
+            return row, read, write
+
         if kind == "bool":
             box = QCheckBox()
             box.setChecked(as_bool(current))
@@ -1436,6 +1723,151 @@ class MainWindow(QMainWindow):
         self._populate_list_files()
         return page
 
+    def _default_comic_dir(self) -> str:
+        root = self.config_values.get(("Settings", "rootDirectory"), "") or ""
+        return str(self._resolve(root) / "_comics") if root else ""
+
+    def _build_comics_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        saved = load_settings()
+
+        blurb = QLabel(
+            "Bundle each artist's folder into a single comic file, so it can be "
+            "opened in a comic reader. Images are stored in reading order, and "
+            "nothing in the download folder is moved or deleted.")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet("color: palette(mid);")
+        outer.addWidget(blurb)
+
+        group = QGroupBox("After a download finishes")
+        form = QFormLayout(group)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self.comic_enabled = QCheckBox("Build a comic for each artist folder")
+        self.comic_enabled.setToolTip(
+            "Only folders that received new files in that run are rebuilt.")
+        self.comic_enabled.setChecked(as_bool(saved.get("comics_enabled", "")))
+        form.addRow("", self.comic_enabled)
+
+        self.comic_format = QComboBox()
+        for value, label in COMIC_FORMATS:
+            self.comic_format.addItem(label, value)
+        self.comic_format.setCurrentIndex(
+            max(self.comic_format.findData(saved.get("comics_format", "cbz")), 0))
+        form.addRow("Format:", self.comic_format)
+
+        if not rar_available():
+            # Offer it, but do not let it fail at the end of a long download.
+            index = self.comic_format.findData("cbr")
+            self.comic_format.model().item(index).setEnabled(False)
+            if self.comic_format.currentData() == "cbr":
+                self.comic_format.setCurrentIndex(self.comic_format.findData("cbz"))
+            note = QLabel(
+                "CBR is unavailable: the <b>rar</b> command is not installed "
+                "(<code>unrar</code> can only extract). On Arch: "
+                "<code>sudo pacman -S rar</code>. CBZ needs nothing extra and "
+                "every comic reader opens it.")
+            note.setWordWrap(True)
+            note.setTextFormat(Qt.TextFormat.RichText)
+            note.setStyleSheet("color: palette(mid);")
+            form.addRow("", note)
+
+        row = QWidget()
+        row_box = QHBoxLayout(row)
+        row_box.setContentsMargins(0, 0, 0, 0)
+        self.comic_dir = QLineEdit(saved.get("comics_output", "") or self._default_comic_dir())
+        self.comic_dir.setPlaceholderText("where the comic files are written")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(lambda: self._browse_into(self.comic_dir))
+        row_box.addWidget(self.comic_dir, 1)
+        row_box.addWidget(browse)
+        form.addRow("Save comics to:", row)
+        outer.addWidget(group)
+
+        manual = QGroupBox("Build now")
+        manual_box = QVBoxLayout(manual)
+        manual_note = QLabel(
+            "Pick a folder to build from. If it holds images directly, it "
+            "becomes one comic; otherwise each sub-folder inside it becomes one.")
+        manual_note.setWordWrap(True)
+        manual_note.setStyleSheet("color: palette(mid);")
+        manual_box.addWidget(manual_note)
+        buttons = QHBoxLayout()
+        self.comic_build = QPushButton("Choose a folder and build…")
+        self.comic_build.clicked.connect(self._build_comics_now)
+        self.comic_stop = QPushButton("Stop")
+        self.comic_stop.setEnabled(False)
+        self.comic_stop.clicked.connect(self._stop_comics)
+        buttons.addWidget(self.comic_build)
+        buttons.addWidget(self.comic_stop)
+        buttons.addStretch(1)
+        manual_box.addLayout(buttons)
+        outer.addWidget(manual)
+
+        outer.addStretch(1)
+        for widget, signal in ((self.comic_enabled, "toggled"),
+                               (self.comic_format, "currentIndexChanged"),
+                               (self.comic_dir, "textChanged")):
+            getattr(widget, signal).connect(self._save_comic_settings)
+        return page
+
+    def _save_comic_settings(self, *_):
+        save_settings(comics_enabled=self.comic_enabled.isChecked(),
+                      comics_format=self.comic_format.currentData(),
+                      comics_output=self.comic_dir.text().strip())
+
+    def _comic_output_dir(self) -> Path:
+        return self._resolve(self.comic_dir.text().strip() or self._default_comic_dir())
+
+    def _start_comics(self, folders):
+        folders = [f for f in folders if Path(f).is_dir()]
+        if not folders:
+            self._append("No folders to build comics from.", "warn")
+            return
+        if self.comic_worker is not None and self.comic_worker.isRunning():
+            self._append("Still building the previous comics.", "warn")
+            return
+        out_dir = self._comic_output_dir()
+        self._append(f"Building {len(folders)} comic(s) into {out_dir}…", "ok")
+        self.comic_worker = ComicWorker(folders, out_dir,
+                                        self.comic_format.currentData())
+        self.comic_worker.log.connect(self._append)
+        self.comic_worker.done.connect(self._on_comics_done)
+        self.comic_worker.start()
+        self.comic_build.setEnabled(False)
+        self.comic_stop.setEnabled(True)
+
+    def _on_comics_done(self, built: int, skipped: int, failed: int):
+        level = "error" if failed else "ok"
+        self._append(
+            f"Comics finished: {built} built, {skipped} skipped, {failed} failed.",
+            level)
+        self.comic_build.setEnabled(True)
+        self.comic_stop.setEnabled(False)
+
+    def _stop_comics(self):
+        if self.comic_worker is not None:
+            self.comic_worker.cancel()
+            self.comic_stop.setEnabled(False)
+            self._append("Stopping comic build…", "warn")
+
+    def _build_comics_now(self):
+        picked = pick_path(self, "Folder to build comics from",
+                           str(self._comic_output_dir().parent), folder=True)
+        if not picked:
+            return
+        chosen = Path(picked)
+        if comic_images_directly_in(chosen):
+            folders = [chosen]
+        else:
+            folders = sorted(child for child in chosen.iterdir() if child.is_dir())
+        if not folders:
+            QMessageBox.information(self, "Build comics",
+                                    f"No images and no sub-folders in {chosen}.")
+            return
+        self._start_comics(folders)
+
     def _build_right(self) -> QWidget:
         panel = QWidget()
         outer = QVBoxLayout(panel)
@@ -1453,12 +1885,15 @@ class MainWindow(QMainWindow):
         self.preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.preview_path = ""
 
+        # Preview on top, log underneath: the log then sits directly above the
+        # progress bars and the box used to answer the downloader's prompts,
+        # which is what those controls actually relate to.
         vertical = QSplitter(Qt.Orientation.Vertical)
-        vertical.addWidget(self.log)
         vertical.addWidget(self.preview)
-        vertical.setStretchFactor(0, 3)
-        vertical.setStretchFactor(1, 1)
-        vertical.setSizes([540, 220])
+        vertical.addWidget(self.log)
+        vertical.setStretchFactor(0, 1)
+        vertical.setStretchFactor(1, 3)
+        vertical.setSizes([240, 520])
         outer.addWidget(vertical, 1)
 
         self.file_bar = QProgressBar()
@@ -1568,6 +2003,7 @@ class MainWindow(QMainWindow):
         self.file_bar.setRange(0, 100)
         self.file_bar.setValue(0)
         self.counts_label.setText("")
+        self._touched_dirs = set()
         self._append(f"$ {self.command_view.text()}", "ok")
 
         self.worker = RunWorker(job, self._config_arg())
@@ -1661,6 +2097,8 @@ class MainWindow(QMainWindow):
         target = Path(path)
         if not target.is_absolute():
             target = PIXIVUTIL_DIR / target
+        if target.parent.is_dir():
+            self._touched_dirs.add(target.parent)
         self.preview_path = str(target)
         self._preview_pixmap = None
         if target.suffix.lower() in IMAGE_SUFFIXES and target.exists():
@@ -1696,6 +2134,11 @@ class MainWindow(QMainWindow):
         self.send_button.setEnabled(False)
         self.mode_combo.setEnabled(True)
         self.setWindowTitle("PixivUtil2")
+
+        if code == 0 and self.comic_enabled.isChecked() and self._touched_dirs:
+            self._start_comics(sorted(self._touched_dirs))
+        elif self.comic_enabled.isChecked() and not self._touched_dirs:
+            self._append("No new files, so no comics to build.", "info")
 
     # -- config ---------------------------------------------------------------
 
@@ -1866,6 +2309,9 @@ class MainWindow(QMainWindow):
                 return
             self.worker.cancel()
             self.worker.wait(16000)   # cancel() escalates to SIGKILL by ~13 s
+        if self.comic_worker is not None and self.comic_worker.isRunning():
+            self.comic_worker.cancel()
+            self.comic_worker.wait(10000)
         event.accept()
 
 

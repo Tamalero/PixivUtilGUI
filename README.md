@@ -102,11 +102,19 @@ and the exact command is shown before you press Run. A few operations do not
 support that and are driven through the console menu over stdin instead. A
 **Send** box can answer any prompt by hand.
 
+Leaving **End page** at 0 means no limit, so the form says plainly that it will
+keep going until there is nothing left.
+
 Also included:
 
+- **Comics** — bundle each artist folder into a single **CBZ** (or CBR, if the
+  `rar` command is installed) after a download, or build them on demand for any
+  folder. Pages are ordered numerically, so `_p2` comes before `_p10`. Nothing
+  in the download folder is moved or deleted.
 - **Settings** — edits the common keys of the checkout's `config.ini`. Only the
   keys shown are rewritten, line by line, and the previous file is kept as
-  `config.ini.gui-bak`.
+  `config.ini.gui-bak`. The browser to impersonate is a dropdown, filled from
+  the `curl_cffi` in your own checkout, with a Custom option.
 - **Lists** — edits `list.txt`, the tag list, the FANBOX list and the blacklist
   files at the paths the config resolves to.
 - A warning when another PixivUtil2 is already running, since they share

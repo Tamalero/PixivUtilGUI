@@ -150,6 +150,23 @@ Do not drop the `RunWorker` reference inside its own `done` handler — destroyi
 a still-running QThread crashes. `_running` tracks state; the object is only
 replaced on the next run, after `wait()`.
 
+## Comics (1.1.0)
+
+`ComicWorker` bundles a folder into a CBZ/CBR. Points worth keeping:
+
+- **CBZ is written `ZIP_STORED`.** The images are already compressed; deflating
+  costs time and saves nothing.
+- **CBR needs the proprietary `rar`.** `unrar` only extracts. When `rar` is
+  absent the format is disabled in the combo up front — not allowed to fail at
+  the end of a long download.
+- **Pages sort with `natural_key()`.** Plain lexicographic order puts `_p10`
+  before `_p2`, which is exactly wrong for a comic.
+- Archives are written to a `.part` file and `os.replace()`d in, so an
+  interrupted build cannot leave a truncated comic behind.
+- After a run, only the folders that actually received files are rebuilt;
+  `MainWindow._touched_dirs` collects them from the `preview` signal, which
+  fires per `Download done ==>` line.
+
 ## Testing
 
 No display needed: `QT_QPA_PLATFORM=offscreen` plus `widget.grab().save(...)`
