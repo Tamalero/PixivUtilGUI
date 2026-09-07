@@ -33,8 +33,10 @@ release), so only the changed blocks are downloaded:
 appimageupdatetool ./PixivUtilGUI-x86_64.AppImage
 ```
 
-Some desktops offer "Update" in the AppImage's own context menu, which does the
-same thing.
+On Arch that tool is in the AUR (`appimageupdate` or `appimageupdate-bin`); it
+is not in the official repositories. Some desktops also offer "Update" in the
+AppImage's own context menu once it has been integrated, which does the same
+thing.
 
 ### From source
 
