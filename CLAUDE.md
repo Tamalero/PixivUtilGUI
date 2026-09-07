@@ -75,6 +75,31 @@ empty, unnavigable filesystem to whoever is clicking.
    quoted path, a `file://` URL (what Dolphin's location bar copies) or a
    subdirectory of the checkout.
 
+### ☠️ Never use a native file dialog in this app (1.0.2)
+
+Fixing (1) had a nasty second-order effect. With the plugin path correct, Qt
+loads the bundled `KDEPlasmaPlatformTheme6.so`, so `QFileDialog` delegates to
+**KDE's** dialog. PyInstaller drags in `libKF6KIOCore/KIOFileWidgets/KIOGui/
+KIOWidgets` as dependencies of that theme, but **none of the KIO *workers***
+(`kf6/kio/file.so`) that actually enumerate a directory. The result is a
+perfect-looking Plasma dialog that lists **nothing at all — no files and no
+subdirectories**, whatever the name filter says. Confirmed on Plasma with the
+filter set to "All files": empty.
+
+So every chooser goes through `pick_path()`, which sets
+`QFileDialog.Option.DontUseNativeDialog`. Qt's own dialog uses
+`QFileSystemModel` and needs nothing outside the bundle. **Do not "improve"
+this by calling `QFileDialog.getOpenFileName()` / `getExistingDirectory()`
+directly** — those use the native dialog and reintroduce the bug. There is a
+test for it: build the dialog offscreen and assert `PixivUtil2.py` and the
+subdirectories appear.
+
+`QDesktopServices.openUrl()` is the same trap (KIO again), so
+`open_externally()` falls back to `xdg-open`.
+
+Keeping the platform theme is still right — it gives Breeze colours and icons.
+Only its dialogs are unusable.
+
 Never make the first run depend on a working native file dialog: an AppImage
 lands on desktops whose Qt integration is not bundled.
 

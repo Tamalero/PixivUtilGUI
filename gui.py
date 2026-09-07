@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QStatusBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # Frozen (PyInstaller/AppImage) builds have no __file__ on disk to speak of, and
 # the bundle is mounted read-only, so nothing may be written next to it.
@@ -111,6 +111,66 @@ def is_pixivutil_dir(path) -> bool:
     """A checkout is usable when the entry point and its handlers are there."""
     path = Path(path).expanduser()
     return (path / SCRIPT).is_file() and (path / "handler").is_dir()
+
+
+def open_externally(path) -> bool:
+    """
+    Hand a file or folder to the desktop.
+
+    Same trap as the file dialogs: under the Plasma platform theme this goes
+    through KIO, and the bundle has no KIO workers, so it can fail silently.
+    Fall back to xdg-open, which is a plain executable on the host.
+    """
+    if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+        return True
+    try:
+        subprocess.Popen(["xdg-open", str(path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def pick_path(parent, caption: str, directory: str, *, folder: bool = False,
+              filters: list | None = None, preselect: str = "") -> str:
+    """
+    Open a file/folder chooser and return the chosen path, or "".
+
+    Always Qt's own dialog, never the desktop's. A PyInstaller bundle drags in
+    libKF6KIO* as a dependency of the Plasma platform theme but none of the KIO
+    *workers* that actually enumerate a directory, so the native dialog comes up
+    looking perfect and lists nothing at all — no files and no subdirectories,
+    whatever the name filter says. Qt's built-in dialog uses QFileSystemModel
+    and needs nothing outside the bundle.
+    """
+    dialog = QFileDialog(parent, caption, directory)
+    dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+    if folder:
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+    else:
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilters(filters or ["All files (*)"])
+    if preselect:
+        dialog.selectFile(preselect)
+
+    # Somewhere to jump to besides $HOME, since the interesting paths are
+    # usually on another mount entirely.
+    sidebar = [QUrl.fromLocalFile(str(Path.home()))]
+    for base in search_bases():
+        if base.is_dir() and not (FROZEN and (base == GUI_DIR or GUI_DIR in base.parents)):
+            sidebar.append(QUrl.fromLocalFile(str(base)))
+    seen, unique = set(), []
+    for url in sidebar:
+        if url.toLocalFile() not in seen:
+            seen.add(url.toLocalFile())
+            unique.append(url)
+    dialog.setSidebarUrls(unique)
+
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return ""
+    chosen = dialog.selectedFiles()
+    return chosen[0] if chosen else ""
 
 
 def normalise_checkout(text: str) -> Path | None:
@@ -1070,10 +1130,8 @@ class ModeForm(QWidget):
 
     def _browse(self, edit: QLineEdit, kind: str):
         start = edit.text().strip() or str(PIXIVUTIL_DIR)
-        if kind == "dir":
-            picked = QFileDialog.getExistingDirectory(self, "Choose a directory", start)
-        else:
-            picked, _ = QFileDialog.getOpenFileName(self, "Choose a file", start)
+        picked = pick_path(self, "Choose a directory" if kind == "dir" else "Choose a file",
+                           start, folder=(kind == "dir"))
         if picked:
             edit.setText(picked)
 
@@ -1130,8 +1188,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act)
 
         act = QAction("Open config.ini", self)
-        act.triggered.connect(lambda: QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(self.config_path))))
+        act.triggered.connect(lambda: open_externally(self.config_path))
         file_menu.addAction(act)
 
         act = QAction("Use a different config.ini…", self)
@@ -1345,8 +1402,8 @@ class MainWindow(QMainWindow):
         return edit, edit.text, edit.setText
 
     def _browse_into(self, edit: QLineEdit):
-        picked = QFileDialog.getExistingDirectory(
-            self, "Choose a directory", edit.text().strip() or str(PIXIVUTIL_DIR))
+        picked = pick_path(self, "Choose a directory",
+                           edit.text().strip() or str(PIXIVUTIL_DIR), folder=True)
         if picked:
             edit.setText(picked)
 
@@ -1673,8 +1730,9 @@ class MainWindow(QMainWindow):
         self._append(f"Reloaded {self.config_path}.", "ok")
 
     def _pick_config(self):
-        picked, _ = QFileDialog.getOpenFileName(
-            self, "Choose a config.ini", str(self.config_path), "INI files (*.ini);;All files (*)")
+        picked = pick_path(self, "Choose a config.ini", str(self.config_path.parent),
+                           filters=["INI files (*.ini)", "All files (*)"],
+                           preselect=self.config_path.name)
         if not picked:
             return
         self.config_path = Path(picked)
@@ -1710,7 +1768,9 @@ class MainWindow(QMainWindow):
         path = Path(root)
         if not path.is_absolute():
             path = PIXIVUTIL_DIR / path
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if not open_externally(path):
+            QMessageBox.warning(self, "Open folder",
+                                f"Could not open {path} in a file manager.")
 
     # -- list files -----------------------------------------------------------
 
@@ -1884,16 +1944,16 @@ class LocateDialog(QDialog):
     # -- input ----------------------------------------------------------------
 
     def _browse_file(self):
-        picked, _ = QFileDialog.getOpenFileName(
-            self, f"Select {SCRIPT}", browse_start_dir(self.edit.text()),
-            f"{SCRIPT} ({SCRIPT});;Python files (*.py);;All files (*)")
+        start = browse_start_dir(self.edit.text())
+        picked = pick_path(self, f"Select {SCRIPT}", start,
+                           filters=["Python scripts (*.py)", "All files (*)"],
+                           preselect=SCRIPT)
         if picked:
             self.edit.setText(picked)
 
     def _browse_dir(self):
-        picked = QFileDialog.getExistingDirectory(
-            self, "Select the PixivUtil2 folder",
-            browse_start_dir(self.edit.text()))
+        picked = pick_path(self, "Select the PixivUtil2 folder",
+                           browse_start_dir(self.edit.text()), folder=True)
         if picked:
             self.edit.setText(picked)
 
