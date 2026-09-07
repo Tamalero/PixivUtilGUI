@@ -53,7 +53,30 @@ unrelated directory (must report NOT FOUND), and a directory next to a checkout
 
 Inside an AppImage `GUI_DIR` is a `/tmp/.mount_*` path that changes every run,
 so **nothing may be written next to the program** — that is why the settings
-file is XDG, not in-tree.
+file is XDG, not in-tree. It is also why `browse_start_dir()` refuses to open a
+file dialog there: the mount holds only `bin/` and `share/`, which looks like an
+empty, unnavigable filesystem to whoever is clicking.
+
+### First-run locator — two bugs fixed in 1.0.1
+
+1. **`QT_PLUGIN_PATH` pointed at a directory that does not exist.** PyInstaller
+   6 puts the bundle under `_internal/`, so the plugins are at
+   `usr/bin/_internal/PyQt6/Qt6/plugins`; AppRun (adapted from Poipiku, built
+   with an older PyInstaller) exported the pre-`_internal` path. Qt then found
+   no `platformthemes` and fell back to its own plain dialogs even though
+   `KDEPlasmaPlatformTheme6.so` **is** bundled. AppRun now probes for
+   `_internal` and only exports the variable if the directory really exists —
+   an unset `QT_PLUGIN_PATH` is better than a wrong one. **Re-check this after
+   any PyInstaller major upgrade.**
+2. **The dialog opened on the read-only mount** and was directory-only, with a
+   title naming a `.py` file. Replaced by `LocateDialog`, which takes a pasted
+   path, a drag from a file manager, or either kind of browse, and validates
+   live. `normalise_checkout()` accepts the folder, `PixivUtil2.py` itself, a
+   quoted path, a `file://` URL (what Dolphin's location bar copies) or a
+   subdirectory of the checkout.
+
+Never make the first run depend on a working native file dialog: an AppImage
+lands on desktops whose Qt integration is not bundled.
 
 ## How the CLI is driven
 

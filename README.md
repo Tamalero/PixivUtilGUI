@@ -67,7 +67,9 @@ On first start the GUI looks for PixivUtil2 in this order:
    (usually `~/.config/pixivutil-gui/settings.ini`, written on first use)
 4. sibling folders — `../PixivUtilFix`, `../PixivUtil2`, `~/PixivUtil2`, …
 
-If none of those match it asks, and remembers the answer. Change it later with
+If none of those match it asks, and remembers the answer. The prompt takes a
+pasted path, a folder dragged in from your file manager, or a browse — and it
+accepts either the folder or `PixivUtil2.py` inside it. Change it later with
 **File → Choose PixivUtil2 folder…**.
 
 When run as an AppImage the sibling search uses the directory the AppImage

@@ -40,13 +40,14 @@ from PyQt6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QPixmap, QTextCursor,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
     QStackedWidget, QStatusBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Frozen (PyInstaller/AppImage) builds have no __file__ on disk to speak of, and
 # the bundle is mounted read-only, so nothing may be written next to it.
@@ -110,6 +111,53 @@ def is_pixivutil_dir(path) -> bool:
     """A checkout is usable when the entry point and its handlers are there."""
     path = Path(path).expanduser()
     return (path / SCRIPT).is_file() and (path / "handler").is_dir()
+
+
+def normalise_checkout(text: str) -> Path | None:
+    """
+    Turn whatever the user pasted into a checkout directory, or None.
+
+    Accepts the folder, the path of PixivUtil2.py inside it, a quoted path, and
+    a file:// URL — Dolphin's location bar copies the last of those, and that is
+    what someone reaches for when a file dialog will not cooperate.
+    """
+    text = (text or "").strip().strip('"').strip("'")
+    if not text:
+        return None
+    if text.startswith("file://"):
+        text = QUrl(text).toLocalFile()      # also undoes %20 and friends
+    candidate = Path(text).expanduser()
+
+    if candidate.is_file():                  # they picked PixivUtil2.py itself
+        candidate = candidate.parent
+    if is_pixivutil_dir(candidate):
+        return candidate.resolve()
+    # Pointed just inside the checkout, e.g. at handler/ — accept the parent.
+    if is_pixivutil_dir(candidate.parent):
+        return candidate.parent.resolve()
+    return None
+
+
+def browse_start_dir(current: str = "") -> str:
+    """
+    A sensible directory for the file dialog to open in.
+
+    Never the program directory: in an AppImage that is a /tmp mount holding
+    nothing but bin/ and share/, which is what made the first-run dialog look
+    empty and unnavigable.
+    """
+    existing = Path((current or "").strip()).expanduser()
+    if existing.is_file():
+        existing = existing.parent
+    if current and existing.is_dir():
+        return str(existing)
+
+    for base in search_bases():
+        if FROZEN and (base == GUI_DIR or GUI_DIR in base.parents):
+            continue                          # inside the read-only mount
+        if base.is_dir():
+            return str(base)
+    return str(Path.home())
 
 
 def remembered_dir() -> Path | None:
@@ -1761,19 +1809,113 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def ask_for_pixivutil(parent=None, start: str = "") -> Path | None:
-    """Let the user point at the checkout, looping until it is a real one."""
-    while True:
+class LocateDialog(QDialog):
+    """
+    Ask for the PixivUtil2 checkout.
+
+    A bare QFileDialog was not good enough: in an AppImage it opens on a
+    read-only /tmp mount, and a directory-only picker gives no way to type or
+    paste a path without knowing the Ctrl+L trick. This offers all three —
+    paste, drag from a file manager, or browse — and says whether what it has
+    is actually a checkout before the OK button does anything.
+    """
+
+    def __init__(self, parent=None, start: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Locate PixivUtil2")
+        self.setMinimumWidth(620)
+        self.setAcceptDrops(True)
+        self._resolved: Path | None = None
+
+        layout = QVBoxLayout(self)
+        blurb = QLabel(
+            f"This is only the front end — it needs a <b>{SCRIPT}</b> checkout "
+            "to drive.<p>Paste the path below, drag the folder in from your "
+            f"file manager, or browse for it. Either the folder or {SCRIPT} "
+            "itself will do.")
+        blurb.setWordWrap(True)
+        blurb.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(blurb)
+
+        row = QHBoxLayout()
+        self.edit = QLineEdit(start)
+        self.edit.setPlaceholderText(f"/path/to/PixivUtil2   (or …/{SCRIPT})")
+        self.edit.textChanged.connect(self._revalidate)
+        browse_file = QPushButton(f"Browse for {SCRIPT}…")
+        browse_file.clicked.connect(self._browse_file)
+        browse_dir = QPushButton("Browse for folder…")
+        browse_dir.clicked.connect(self._browse_dir)
+        row.addWidget(self.edit, 1)
+        row.addWidget(browse_file)
+        row.addWidget(browse_dir)
+        layout.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._revalidate()
+        self.edit.setFocus()
+
+    # -- validation -----------------------------------------------------------
+
+    def _revalidate(self, *_):
+        self._resolved = normalise_checkout(self.edit.text())
+        typed = self.edit.text().strip()
+        if self._resolved is not None:
+            self.status.setText(f"✓ Found {SCRIPT} in {self._resolved}")
+            self.status.setStyleSheet("color: #2e7d32;")
+        elif not typed:
+            self.status.setText("Waiting for a path…")
+            self.status.setStyleSheet("color: palette(mid);")
+        else:
+            self.status.setText(
+                f"✗ No {SCRIPT} with a handler/ directory there.")
+            self.status.setStyleSheet("color: #c62828;")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            self._resolved is not None)
+
+    # -- input ----------------------------------------------------------------
+
+    def _browse_file(self):
+        picked, _ = QFileDialog.getOpenFileName(
+            self, f"Select {SCRIPT}", browse_start_dir(self.edit.text()),
+            f"{SCRIPT} ({SCRIPT});;Python files (*.py);;All files (*)")
+        if picked:
+            self.edit.setText(picked)
+
+    def _browse_dir(self):
         picked = QFileDialog.getExistingDirectory(
-            parent, f"Where is {SCRIPT}?", start or str(GUI_DIR.parent))
-        if not picked:
-            return None
-        if is_pixivutil_dir(picked):
-            return Path(picked).resolve()
-        QMessageBox.warning(
-            parent, "Not a PixivUtil2 checkout",
-            f"{picked}\n\ndoes not contain {SCRIPT} and a handler/ directory.")
-        start = picked
+            self, "Select the PixivUtil2 folder",
+            browse_start_dir(self.edit.text()))
+        if picked:
+            self.edit.setText(picked)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            self.edit.setText(urls[0].toLocalFile())
+            event.acceptProposedAction()
+
+    def value(self) -> Path | None:
+        return self._resolved
+
+
+def ask_for_pixivutil(parent=None, start: str = "") -> Path | None:
+    dialog = LocateDialog(parent, start)
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        return dialog.value()
+    return None
 
 
 def report_paths(explicit: str = "") -> int:
@@ -1822,11 +1964,6 @@ def main():
     global PIXIVUTIL_DIR
     found = locate_pixivutil(explicit)
     if found is None:
-        QMessageBox.information(
-            None, "Where is PixivUtil2?",
-            f"This is only the front end — it needs a {SCRIPT} checkout to "
-            "drive.\n\nPick the folder it lives in; the choice is remembered "
-            f"in {SETTINGS_FILE.name}.")
         found = ask_for_pixivutil()
         if found is None:
             return 1
