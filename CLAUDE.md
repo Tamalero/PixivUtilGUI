@@ -10,7 +10,12 @@ isolation and shell-dialect rules.
 
 - **Platform:** Arch/CachyOS, x86_64, system Python 3 + `python-pyqt6` via pacman
 - **Remote:** `origin` → **https://github.com/Tamalero/PixivUtilGUI** (public)
-- **Released:** AppImage (Type 2) with `gh-releases-zsync` autoupdate — see Packaging
+- **Released:** AppImage (Type 2) with `gh-releases-zsync` autoupdate.
+  Current: **1.1.0** (2026-09-07). See Packaging below.
+- ⚠️ **This repo is public.** No real account id, cookie, library path or
+  `/mnt/...` path may appear in tracked files, commit messages or release
+  notes. Grep before every push — see the anonymisation rule in
+  `../../CLAUDE.md`.
 - **Git author:** pinned in this repo's local config. This is a `Personal/`
   project, so it takes the **personal** address, not the Acorn one — see the
   git-author hard rule in the workspace root `CLAUDE.md`. Do not spell the
@@ -166,6 +171,58 @@ replaced on the next run, after `wait()`.
 - After a run, only the folders that actually received files are rebuilt;
   `MainWindow._touched_dirs` collects them from the `preview` signal, which
   fires per `Download done ==>` line.
+
+## Packaging and releasing
+
+`./build-appimage.fish` does everything: regenerates the icons, runs
+PyInstaller, assembles the AppDir, and calls `appimagetool` with the update
+string. Needs `pyinstaller`, `appimagetool`, `zsyncmake`.
+
+- **`VERSION` in `gui.py` is the single source of truth.** The build script
+  reads it (`python3 -c "import gui; print(gui.VERSION)"`) and it is what
+  `--version` reports. Bump it *before* building or the release is mislabelled.
+- **Update string:**
+  `gh-releases-zsync|Tamalero|PixivUtilGUI|latest|PixivUtilGUI-x86_64.AppImage.zsync`.
+  The `.zsync` asset must keep exactly that filename or every update check
+  404s. Both files go on the release:
+  `gh release create vX.Y.Z PixivUtilGUI-x86_64.AppImage PixivUtilGUI-x86_64.AppImage.zsync`
+- **PixivUtil2 is never bundled** — only the GUI and Qt. That is why the image
+  stays valid when the checkout is updated.
+- The build script **moves** stale `build/`, `dist/` and `*.AppDir` aside with a
+  timestamp instead of deleting them; never add `rm -rf` here (workspace rule).
+- `appimagetool` warns "AppImage not signed". Harmless; GPG signing is not set
+  up.
+
+### Verifying an update actually works
+
+**`zsync` the CLI does not work against GitHub releases** — it mishandles the
+signed redirect to `release-assets.githubusercontent.com`. That is not a fault
+in the release; ranged requests return HTTP 206 fine. Use the real client:
+
+```bash
+# no system install needed
+curl -sL -o appimageupdatetool.AppImage "$(gh api repos/AppImage/AppImageUpdate/releases/latest \
+  --jq '.assets[] | select(.name|test("appimageupdatetool.*x86_64.AppImage$")) | .browser_download_url')"
+chmod +x appimageupdatetool.AppImage
+./appimageupdatetool.AppImage --check-for-update <old.AppImage>   # exit 1 = update available
+./appimageupdatetool.AppImage <old.AppImage>
+```
+
+A good result reads `used <almost all> local, fetched <a few hundred KB>` and
+`checksum matches OK`. Confirm the new file's `--version` and that its SHA-256
+matches the image that was uploaded. Every release so far has been verified
+this way (1.0.0→1.0.1→1.0.2→1.1.0, each ~650 KB of a 105 MB image).
+
+## Release history
+
+- **1.0.0** first release.
+- **1.0.1** `QT_PLUGIN_PATH` pointed at a pre-PyInstaller-6 path that did not
+  exist; new locator dialog (paste / drag / browse) because the old one opened
+  on the read-only AppImage mount.
+- **1.0.2** the 1.0.1 plugin fix let the KDE dialog load, which then listed
+  **nothing** — see the native-dialog warning above.
+- **1.1.0** Comics tab; impersonation dropdown; R-18 warning; end-page-0
+  warning; preview moved above the log.
 
 ## Testing
 
